@@ -156,3 +156,79 @@ class AuditResponse(BaseModel):
     resolution: Optional[Dict[str, str]]
     sources: Optional[List[ResolutionSourceOut]]
     conflicts: List[ConflictOut]
+
+
+class ExportBundleIn(BaseModel):
+    """导出包请求：按时间排序的审计 ID 列表（1~100 个）。"""
+
+    audit_ids: List[str] = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+        description="按时间排序的审计 ID 列表，不得重复",
+    )
+    include_conflicts: bool = Field(True, description="导出记录中是否包含 conflicts 字段")
+
+    @field_validator("audit_ids")
+    @classmethod
+    def _validate_unique_ids(cls, value: List[str]) -> List[str]:
+        if len(set(value)) != len(value):
+            raise ValueError("audit_ids 包含重复 ID")
+        return value
+
+
+class ManifestRecordOut(BaseModel):
+    """manifest 中一条记录的摘要条目。"""
+
+    index: int
+    audit_id: str
+    created_at: str
+    sha256: str
+
+
+class BundleManifest(BaseModel):
+    """导出包 manifest：记录导出参数与逐条摘要。"""
+
+    version: int
+    generator: str
+    include_conflicts: bool
+    record_count: int
+    records: List[ManifestRecordOut]
+
+
+class ExportBundleResponse(BaseModel):
+    manifest: BundleManifest
+    manifest_sha256: str = Field(..., description="manifest 规范 JSON 的 sha256（整体摘要）")
+    record_sha256: List[str] = Field(
+        ..., description="每条 JSONL 记录（不含换行）的 sha256，与 manifest.records 一致"
+    )
+    jsonl: str = Field(..., description="确定性 JSONL 内容：每条记录一行规范 JSON，行尾 \\n")
+    bundle_gzip_base64: str = Field(
+        ..., description='{"manifest","jsonl"} 规范 JSON 的 gzip（mtime=0）+ Base64'
+    )
+
+
+class VerifyBundleIn(BaseModel):
+    """校验请求：回传导出响应中的 manifest / manifest_sha256 / jsonl。"""
+
+    manifest: BundleManifest
+    manifest_sha256: str = Field(..., description="导出时返回的整体摘要，作为信任锚点")
+    jsonl: str = Field(..., description="导出时返回的 JSONL 内容")
+
+
+VerifyErrorType = Literal[
+    "invalid_manifest",
+    "invalid_jsonl",
+    "record_count_mismatch",
+    "record_order_mismatch",
+    "record_hash_mismatch",
+    "manifest_hash_mismatch",
+]
+
+
+class VerifyBundleResponse(BaseModel):
+    verified: bool
+    first_error_index: Optional[int] = Field(
+        ..., description="首个出错记录的 0 基下标；manifest 级/全局错误为 null"
+    )
+    error: Optional[VerifyErrorType] = Field(..., description="错误类型；verified=true 时为 null")

@@ -7,6 +7,8 @@
 - **无解时不会只报第一个冲突**：遍历整棵搜索树，汇总所有本质不同的死路，
   对每条死路的约束集合做贪心极小化，返回**最小冲突链**以及链上**每一条约束的逐跳来源**；
 - 所有审计结果持久化到 SQLite，支持按 ID 查询、列表过滤；
+- 审计结果可导出为**可验证导出包**（确定性 JSONL + 逐条 sha256 + 整体 manifest 摘要 +
+  gzip/Base64），并可随时回传校验完整性与顺序，任何字节或顺序改动都会被识别；
 - 自带健康检查、OpenAPI 文档、示例注册表与一键 Docker Compose 启动。
 
 ## 一条命令启动
@@ -118,6 +120,54 @@ curl -s 'http://localhost:8000/api/v1/audits?status=infeasible' | jq
 curl -s http://localhost:8000/api/v1/audits/<id> | jq
 ```
 
+### 4. 导出可验证的审计包并校验
+
+```bash
+# 导出：audit_ids 按时间排序（1~100 个，不得重复），include_conflicts 控制是否包含冲突明细
+curl -s -X POST http://localhost:8000/api/v1/audits/export-bundle \
+  -H 'Content-Type: application/json' \
+  -d '{"audit_ids":["<id1>","<id2>"],"include_conflicts":true}' > bundle.json
+
+jq '{manifest_sha256, record_sha256}' bundle.json
+```
+
+```bash
+# 校验：把导出响应中的 manifest / manifest_sha256 / jsonl 原样回传
+jq '{manifest, manifest_sha256, jsonl}' bundle.json | \
+  curl -s -X POST http://localhost:8000/api/v1/audits/verify-bundle \
+    -H 'Content-Type: application/json' -d @- | jq
+# => {"verified":true,"first_error_index":null,"error":null}
+```
+
+一条命令从列表到导出再到校验：
+
+```bash
+ids=$(curl -s 'http://localhost:8000/api/v1/audits?limit=5' | jq -c '[.items[].id]')
+curl -s -X POST http://localhost:8000/api/v1/audits/export-bundle \
+  -H 'Content-Type: application/json' \
+  -d "{\"audit_ids\":$ids,\"include_conflicts\":true}" \
+| jq '{manifest, manifest_sha256, jsonl}' \
+| curl -s -X POST http://localhost:8000/api/v1/audits/verify-bundle \
+    -H 'Content-Type: application/json' -d @- | jq
+```
+
+#### 导出包格式与校验规则
+
+- 每条记录序列化为**规范 JSON**（键按字典序、紧凑分隔符、UTF-8），一行一条，行尾 `\n`；
+- `record_sha256[i]` = 第 i 行（不含换行）的 sha256；`manifest.records` 同步记录
+  `(index, audit_id, created_at, sha256)`；
+- `manifest_sha256` = manifest 规范 JSON 的 sha256，是整体摘要与信任锚点；
+- `bundle_gzip_base64` = `{"manifest":…,"jsonl":…}` 规范 JSON 的 gzip（`mtime=0`）+ Base64，
+  相同输入产生字节级一致的输出；
+- 校验依次检查：manifest 内部一致性 → JSONL 可解析 → 记录数 → 记录顺序
+  （每行 `id` 与 manifest 声明的 `audit_id` 一致）→ 逐条 sha256 → 整体 manifest 摘要；
+  任一失败返回 `verified=false`、`first_error_index`（记录级错误的 0 基下标，全局错误为
+  `null`）与错误类型（`invalid_manifest` / `invalid_jsonl` / `record_count_mismatch` /
+  `record_order_mismatch` / `record_hash_mismatch` / `manifest_hash_mismatch`），
+  任何字节或顺序改动都会被识别；
+- 导出与校验均**不写入数据库**（校验为纯计算）；未知 ID 返回 `404`，
+  重复 ID 或列表越界（1~100）返回 `422`。
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
@@ -126,6 +176,8 @@ curl -s http://localhost:8000/api/v1/audits/<id> | jq
 | `POST` | `/api/v1/audits` | 提交清单进行审计，返回求解结果并落库（`201`） |
 | `GET`  | `/api/v1/audits` | 审计记录列表，支持 `status` / `limit` / `offset` |
 | `GET`  | `/api/v1/audits/{id}` | 查询单条审计的完整结果 |
+| `POST` | `/api/v1/audits/export-bundle` | 按给定顺序导出可验证审计包（确定性 JSONL + 逐条 sha256 + manifest 摘要 + gzip Base64），不落库 |
+| `POST` | `/api/v1/audits/verify-bundle` | 校验导出包的 manifest、记录顺序与各级摘要，返回首个错误位置与类型，不落库 |
 | `GET`  | `/api/v1/registry/packages` | 查看注册表全部包与版本 |
 | `PUT`  | `/api/v1/registry/packages/{name}` | 新增/覆盖一个包及其版本依赖 |
 
@@ -183,6 +235,7 @@ app/
   solver.py     # 回溯求解器、冲突极小化与来源链
   semver.py     # SemVer 2.0.0 与版本范围解析
   database.py   # SQLite 建表/注册表/审计记录
+  bundle.py     # 可验证导出包：规范 JSONL、逐条/整体摘要与校验
   models.py     # Pydantic 请求/响应模型
 data/
   seed_registry.json   # 示例注册表
