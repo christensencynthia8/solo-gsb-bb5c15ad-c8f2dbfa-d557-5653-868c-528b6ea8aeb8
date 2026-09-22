@@ -16,6 +16,7 @@ from fastapi import FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 
 from . import __version__
+from .bundle import build_bundle, decode_bundle_base64, verify_bundle
 from .database import (
     DEFAULT_DB_PATH,
     connect,
@@ -31,6 +32,10 @@ from .database import (
 from .models import (
     AuditResponse,
     AuditSummary,
+    BundleExportIn,
+    BundleExportResponse,
+    BundleVerifyIn,
+    BundleVerifyResponse,
     HealthResponse,
     ManifestIn,
     PackageIn,
@@ -93,6 +98,8 @@ def index() -> dict:
             "POST /api/v1/audits",
             "GET /api/v1/audits",
             "GET /api/v1/audits/{audit_id}",
+            "POST /api/v1/audits/export-bundle",
+            "POST /api/v1/audits/verify-bundle",
             "PUT /api/v1/registry/packages/{name}",
             "GET /api/v1/registry/packages",
         ],
@@ -215,6 +222,80 @@ def get_audit_detail(audit_id: str, request: Request) -> AuditResponse:
         raise HTTPException(status_code=404, detail=f"审计记录不存在: {audit_id}")
     result = json.loads(row["result_json"])
     return AuditResponse(**result)
+
+
+@app.post(
+    "/api/v1/audits/export-bundle",
+    response_model=BundleExportResponse,
+    tags=["audits"],
+)
+def export_bundle(payload: BundleExportIn, request: Request) -> BundleExportResponse:
+    """把已存在的审计结果打包成确定性、可验证的 JSONL 导出包。
+
+    只读数据库，不写入任何内容。
+    """
+    audit_ids = payload.audit_ids
+    duplicates = sorted({aid for aid in audit_ids if audit_ids.count(aid) > 1})
+    if duplicates:
+        raise HTTPException(
+            status_code=422, detail=f"audit_ids 包含重复 ID: {duplicates}"
+        )
+
+    conn = get_conn(request)
+    records: list[dict] = []
+    for audit_id in audit_ids:
+        row = get_audit(conn, audit_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"审计记录不存在: {audit_id}")
+        result = json.loads(row["result_json"])
+        # 复用现有响应模型序列化，保证字段形态与 GET 详情一致
+        records.append(AuditResponse(**result).model_dump(mode="json"))
+
+    bundle = build_bundle(records, include_conflicts=payload.include_conflicts)
+    return BundleExportResponse(**bundle)
+
+
+@app.post(
+    "/api/v1/audits/verify-bundle",
+    response_model=BundleVerifyResponse,
+    tags=["audits"],
+)
+def verify_bundle_endpoint(payload: BundleVerifyIn) -> BundleVerifyResponse:
+    """校验导出包：manifest、记录顺序、逐条摘要与整体摘要。
+
+    纯内存计算，不读写数据库。任何字节或顺序改动都会返回 verified=false。
+    """
+    if payload.gzip_base64 is not None:
+        envelope, error_type = decode_bundle_base64(payload.gzip_base64)
+        if error_type is not None:
+            return BundleVerifyResponse(
+                verified=False, first_error_index=-1, error_type=error_type
+            )
+        verified, index, error_type, detail = verify_bundle(
+            envelope["manifest"], envelope["jsonl"]
+        )
+        return BundleVerifyResponse(
+            verified=verified,
+            first_error_index=index,
+            error_type=error_type,
+            error_detail=detail,
+        )
+
+    if payload.jsonl is not None and payload.manifest is not None:
+        verified, index, error_type, detail = verify_bundle(
+            payload.manifest, payload.jsonl
+        )
+        return BundleVerifyResponse(
+            verified=verified,
+            first_error_index=index,
+            error_type=error_type,
+            error_detail=detail,
+        )
+
+    raise HTTPException(
+        status_code=422,
+        detail="必须提供 gzip_base64，或同时提供 jsonl 与 manifest",
+    )
 
 
 @app.put("/api/v1/registry/packages/{name}", response_model=dict, tags=["registry"])

@@ -156,3 +156,88 @@ class AuditResponse(BaseModel):
     resolution: Optional[Dict[str, str]]
     sources: Optional[List[ResolutionSourceOut]]
     conflicts: List[ConflictOut]
+
+
+# ---------- 可验证导出包 ----------
+
+class BundleExportIn(BaseModel):
+    """导出包请求：按时间排序的审计 ID 列表（1～100）。"""
+
+    audit_ids: List[str] = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+        description="按创建时间排序的审计 ID 列表（1～100 个，不可重复）",
+    )
+    include_conflicts: bool = Field(
+        False, description="导出的每条记录是否包含 conflicts 字段"
+    )
+
+    @field_validator("audit_ids")
+    @classmethod
+    def _validate_audit_ids(cls, value: List[str]) -> List[str]:
+        for audit_id in value:
+            if not isinstance(audit_id, str) or not audit_id.strip():
+                raise ValueError("audit_id 不能为空")
+        return value
+
+
+class BundleRecordDigest(BaseModel):
+    audit_id: str
+    sha256: str
+
+
+class BundleManifest(BaseModel):
+    format: str
+    format_version: str
+    include_conflicts: bool
+    record_count: int
+    payload_sha256: str
+    records: List[BundleRecordDigest]
+    manifest_sha256: str
+
+
+class BundleExportResponse(BaseModel):
+    format: str
+    format_version: str
+    include_conflicts: bool
+    record_count: int
+    jsonl: str = Field(..., description="确定性 JSONL 文本，每行一条审计记录并以 \\n 结尾")
+    records: List[BundleRecordDigest] = Field(..., description="每条记录的 sha256（对该行字节）")
+    manifest: BundleManifest
+    manifest_sha256: str = Field(..., description="清单自身（除该字段外）的 sha256")
+    gzip_base64: str = Field(..., description="信封 JSON（manifest+jsonl）经 gzip 后的 Base64")
+
+
+class BundleVerifyIn(BaseModel):
+    """校验请求：二选一——直接传包的 Base64，或分别传 jsonl/manifest。"""
+
+    gzip_base64: Optional[str] = Field(None, description="导出接口返回的 gzip Base64 包")
+    jsonl: Optional[str] = Field(None, description="与 manifest 一起提交的 JSONL 文本")
+    manifest: Optional[Dict[str, object]] = Field(None, description="与 jsonl 一起提交的清单")
+
+
+class BundleVerifyResponse(BaseModel):
+    verified: bool
+    first_error_index: int = Field(
+        ..., description="首个出错记录下标（0 起）；错误不针对记录时为 -1"
+    )
+    error_type: Optional[
+        Literal[
+            "bundle_base64_invalid",
+            "bundle_gzip_invalid",
+            "bundle_envelope_invalid",
+            "malformed_manifest",
+            "manifest_digest_mismatch",
+            "unsupported_format",
+            "malformed_jsonl",
+            "record_count_mismatch",
+            "record_parse_error",
+            "record_id_missing",
+            "record_order_mismatch",
+            "record_digest_mismatch",
+            "conflicts_flag_mismatch",
+            "payload_digest_mismatch",
+        ]
+    ] = None
+    error_detail: Optional[str] = None

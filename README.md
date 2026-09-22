@@ -118,6 +118,99 @@ curl -s 'http://localhost:8000/api/v1/audits?status=infeasible' | jq
 curl -s http://localhost:8000/api/v1/audits/<id> | jq
 ```
 
+### 4. 导出可验证审计包并校验
+
+把**按创建时间排序**的 `audit_id` 列表（1～100 个、不可重复）交给导出接口，
+得到确定性的 JSONL 导出包：每条记录是规范化 JSON（键排序、紧凑、UTF-8），
+附带逐行 `sha256`、整体 `payload_sha256`、清单摘要 `manifest_sha256`，
+以及整个包 gzip 后的 Base64。导出与校验均为只读，不写入数据库。
+
+```bash
+# include_conflicts=false（默认）时行内不含 conflicts 字段
+curl -s -X POST http://localhost:8000/api/v1/audits/export-bundle \
+  -H 'Content-Type: application/json' \
+  -d '{"audit_ids":["<id-早>","<id-晚>"],"include_conflicts":true}' \
+  | jq '{record_count, manifest_sha256, records, jsonl}'
+```
+
+返回（节选）：
+
+```json
+{
+  "record_count": 2,
+  "manifest_sha256": "…",
+  "records": [
+    {"audit_id": "…", "sha256": "…（对该行字节）"},
+    {"audit_id": "…", "sha256": "…"}
+  ],
+  "jsonl": "{…id=早…}\n{…id=晚…}\n",
+  "manifest": {
+    "format": "audit-jsonl-bundle",
+    "format_version": "1.0",
+    "include_conflicts": true,
+    "record_count": 2,
+    "payload_sha256": "…（对整个 JSONL 字节串）",
+    "records": [ …同上… ],
+    "manifest_sha256": "…（对清单自身规范化 JSON 的摘要）"
+  },
+  "gzip_base64": "…（信封 JSON 经 gzip、再 Base64，确定性压缩 mtime=0）"
+}
+```
+
+同样的输入每次导出的 `jsonl` / `manifest_sha256` / `gzip_base64` 字节完全一致。
+错误码：未知 ID 返回 `404`；重复 ID、列表为空或超过 100 个返回 `422`。
+
+校验时直接回传 `gzip_base64`（也可以分别提交 `jsonl` + `manifest`）：
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/audits/verify-bundle \
+  -H 'Content-Type: application/json' \
+  -d "{\"gzip_base64\":\"$BUNDLE_B64\"}" | jq
+```
+
+通过时：
+
+```json
+{"verified": true, "first_error_index": -1, "error_type": null, "error_detail": null}
+```
+
+任何字节或记录顺序被改动都会失败，`first_error_index` 指向第一条出错的记录
+（错误不针对记录时为 `-1`），`error_type` 给出错误类别：
+
+| error_type | 含义 |
+| --- | --- |
+| `bundle_base64_invalid` / `bundle_gzip_invalid` / `bundle_envelope_invalid` | Base64 / gzip / 信封无法解码 |
+| `malformed_manifest` | 清单缺字段或字段类型错误 |
+| `manifest_digest_mismatch` | `manifest_sha256` 与清单内容不一致（清单被改动） |
+| `unsupported_format` | 格式名或版本不支持 |
+| `malformed_jsonl` | JSONL 不是字符串、未以换行结尾或含空行 |
+| `record_count_mismatch` | JSONL 行数与清单记录数不一致 |
+| `record_parse_error` | 某行不是合法 JSON |
+| `record_id_missing` / `record_order_mismatch` | 记录缺少 id / id 与清单顺序不符（**顺序被改动**） |
+| `record_digest_mismatch` | 某行 sha256 与清单不符（**行字节被改动**） |
+| `conflicts_flag_mismatch` | 行内 conflicts 字段与 `include_conflicts` 标志不一致 |
+| `payload_digest_mismatch` | `payload_sha256` 与整体 JSONL 不一致（换行等跨行字节改动） |
+
+本地离线校验（不依赖服务端、不需要数据库）也可以直接用标准库：
+
+```python
+import base64, gzip, hashlib, json
+
+def verify(gzip_base64):
+    env = json.loads(gzip.decompress(base64.b64decode(gzip_base64)))
+    m = env["manifest"]
+    body = {k: v for k, v in m.items() if k != "manifest_sha256"}
+    canon = lambda o: json.dumps(o, ensure_ascii=False, sort_keys=True,
+                                 separators=(",", ":")).encode()
+    assert hashlib.sha256(canon(body)).hexdigest() == m["manifest_sha256"]   # 清单
+    lines = env["jsonl"].encode()[:-1].split(b"\n")
+    assert len(lines) == m["record_count"]                                  # 记录数
+    for i, line in enumerate(lines):
+        assert json.loads(line)["id"] == m["records"][i]["audit_id"]        # 顺序
+        assert hashlib.sha256(line).hexdigest() == m["records"][i]["sha256"]  # 逐条摘要
+    assert hashlib.sha256(env["jsonl"].encode()).hexdigest() == m["payload_sha256"]  # 整体
+```
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
@@ -126,6 +219,8 @@ curl -s http://localhost:8000/api/v1/audits/<id> | jq
 | `POST` | `/api/v1/audits` | 提交清单进行审计，返回求解结果并落库（`201`） |
 | `GET`  | `/api/v1/audits` | 审计记录列表，支持 `status` / `limit` / `offset` |
 | `GET`  | `/api/v1/audits/{id}` | 查询单条审计的完整结果 |
+| `POST` | `/api/v1/audits/export-bundle` | 把已有审计结果打包为确定性、可验证的 JSONL 导出包（只读，不写库） |
+| `POST` | `/api/v1/audits/verify-bundle` | 校验导出包：manifest、记录顺序、逐条摘要、整体摘要（不写库） |
 | `GET`  | `/api/v1/registry/packages` | 查看注册表全部包与版本 |
 | `PUT`  | `/api/v1/registry/packages/{name}` | 新增/覆盖一个包及其版本依赖 |
 
@@ -173,7 +268,8 @@ pytest -q
 ```
 
 测试覆盖 SemVer 解析（含预发布排序与 npm 范围语义）、求解器
-（可行/无解/深层传递/多冲突枚举/预算保护）与全部 HTTP 接口（临时 SQLite，互不污染）。
+（可行/无解/深层传递/多冲突枚举/预算保护）、全部 HTTP 接口（临时 SQLite，互不污染），
+以及导出包的确定性、重复/未知 ID 错误码与逐字节/顺序篡改识别。
 
 ## 项目结构
 
@@ -184,6 +280,7 @@ app/
   semver.py     # SemVer 2.0.0 与版本范围解析
   database.py   # SQLite 建表/注册表/审计记录
   models.py     # Pydantic 请求/响应模型
+  bundle.py     # 可验证 JSONL 导出包的确定性构造与校验（sha256/gzip，纯内存）
 data/
   seed_registry.json   # 示例注册表
 tests/                  # pytest 测试套件
